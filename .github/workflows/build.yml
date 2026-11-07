@@ -535,14 +535,357 @@ jobs:
               break
             fi
           done
+          - name: Restore compiler cache
+        id: ccache_restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: twrp-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+          restore-keys: |
+            twrp-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}-
+
+      - name: Configure compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ccache
+          install -d "$CCACHE_DIR"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -z
+          ccache -p
+
+      - name: Install repo tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$HOME/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync TWRP sources
+        timeout-minutes: 75
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 修复 "unsupported checkout state": repo 浅克隆 (--depth=1) 同步中途
+          # 网络中断后, 个别项目的 .git 会进入 repo 无法自愈的损坏状态, 普通
+          # repo sync 重试必然再次撞同一个坏状态。唯一可靠的恢复是删掉该项目
+          # 的工作树与 .repo 存储, 让 repo 重新克隆。
+          recover_bad_projects() {
+            local log="$1"
+            [[ -f "$log" ]] || return 0
+            local paths
+            paths="$(grep -oE 'TWRP/[^ ]+/\.git' "$log" \
+                      | sed -E 's#^TWRP/##; s#/\.git$##' | sort -u)"
+            if [[ -z "$paths" ]]; then
+              paths="$(sed -n '/Failing repos/,/^$/p' "$log" \
+                        | grep -vE 'Failing repos|^$' | tr -d ':' | sort -u)"
+            fi
+            [[ -z "$paths" ]] && return 0
+            for p in $paths; do
+              echo "  purging bad project: $p"
+              rm -rf "$TWRP_TOP/$p"
+              rm -rf "$TWRP_TOP/.repo/projects/$p.git"
+              rm -rf "$TWRP_TOP/.repo/project-objects/$p.git"
+            done
+          }
+
+          # twrp-16.0 官方 manifest 开箱即用, 无需 OrangeFox 那套 pinned+补丁。
+          export GIT_CONFIG_GLOBAL="$GITHUB_WORKSPACE/ci-gitconfig"
+          git config --global http.lowSpeedLimit 1
+          git config --global http.lowSpeedTime 600
+
+          mkdir -p "$TWRP_TOP"
+          cd "$TWRP_TOP"
+          repo init --depth=1 \
+            -u ${{ github.event.inputs.MANIFEST_URL }} \
+            -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ sync heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          sync_succeeded=0
+          for sync_attempt in 1 2 3 4; do
+            if repo sync -c -j16 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch \
+                 2>&1 | tee /tmp/repo-sync.log; then
+              sync_succeeded=1
+              break
+            fi
+            echo "::warning::同步第 ${sync_attempt} 次失败, 清理损坏项目后重试"
+            recover_bad_projects /tmp/repo-sync.log
+            sleep 5
+          done
+          if [[ "$sync_succeeded" -ne 1 ]]; then
+            echo "::error::源码同步四次均失败。" >&2
+            exit 1
+          fi
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Install device tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$TWRP_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          rsync -a --delete \
+            --exclude .git \
+            "$GITHUB_WORKSPACE/device-tree/" \
+            "$TWRP_TOP/${{ github.event.inputs.DEVICE_PATH }}/"
+
+          # 兜底补执行位。设备树在 Windows 上开发时 git 默认 core.filemode=false,
+          # 脚本可能以 100644 提交, AOSP 构建会直接执行设备树里的 .sh, 缺执行位
+          # 在 Linux CI 上直接 Permission denied。
+          echo "::group::修正设备树脚本执行位"
+          find "$TWRP_TOP/${{ github.event.inputs.DEVICE_PATH }}" \
+            -type f -name '*.sh' -print -exec chmod +x {} \; || true
+          echo "::endgroup::"
+
+      - name: Clone common tree
+        if: ${{ github.event.inputs.COMMON_TREE_URL != '' && github.event.inputs.COMMON_PATH != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            ${{ github.event.inputs.COMMON_TREE_URL }} \
+            -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            "$TWRP_TOP/${{ github.event.inputs.COMMON_PATH }}"
+
+      - name: Apply device tree patches
+        shell: bash
+        working-directory: ${{ env.TWRP_TOP }}
+        run: |
+          set -euo pipefail
+          # 设备树的 apply-patches.sh 必须在源码根目录执行; 无补丁时为空操作。
+          script="${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh"
+          if [[ -f "$script" ]]; then
+            chmod +x "$script"
+            sh "$script"
+          fi
+
+      # 必须在编译**之前**跑。偏移溢出只会在 ninja 的最后一个 target 上暴露:
+      #     struct.error: 'I' format requires 0 <= number <= 4294967295
+      # 而那时前面 18000+ 个 target 已经全部跑完 —— 真实代价是几十分钟白跑。
+      # 根因: 镜像 header 里的地址是绝对地址, 而 mkbootimg 的 --*_offset 是
+      # 相对 --base 的偏移 (pd2415 的 base 是 0x3fff8000, 照抄绝对地址必炸)。
+      - name: Validate boot image offsets
+        shell: bash
+        run: |
+          set -euo pipefail
+          configs=()
+          for path in "${{ github.event.inputs.DEVICE_PATH }}" \
+                       "${{ github.event.inputs.COMMON_PATH }}"; do
+            if [[ -z "$path" ]]; then
+              continue
+            fi
+            config="$TWRP_TOP/$path/BoardConfig.mk"
+            if [[ -f "$config" ]]; then
+              configs+=("$config")
+            fi
+          done
+          if [[ "${#configs[@]}" -eq 0 ]]; then
+            echo "::error::未找到任何 BoardConfig.mk, 设备树未正确安装"
+            exit 1
+          fi
+          # 退出码: 0 = 通过; 1 = 偏移溢出 (必然失败, 立刻停);
+          #         2 = 用法错误 —— 也当失败处理。
+          bash "$GITHUB_WORKSPACE/builder/.github/scripts/check-boot-offsets.sh" "${configs[@]}"
+
+      - name: Sync Device Dependencies
+        shell: bash
+        working-directory: ${{ env.TWRP_TOP }}
+        run: |
+          set -euo pipefail
+          # 必须在删除 .repo 之前完成; omni_*.dependencies / twrp_*.dependencies 二者取其一。
+          for dep in twrp omni; do
+            f="${{ github.event.inputs.DEVICE_PATH }}/$dep.dependencies"
+            if [[ -f "$f" ]]; then
+              bash "$GITHUB_WORKSPACE/builder/scripts/convert.sh" "$f"
+              break
+            fi
+          done
+          repo sync -j16
+
+      - name: Drop sync metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$TWRP_TOP/.repo" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Check compilation capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          required_kib=$((REQUIRED_COMPILE_DISK_GIB * 1024 * 1024))
+          if [[ -z "${available_kib}" || "${available_kib}" -lt "${required_kib}" ]]; then
+            echo "::error::删除 .repo 后需要至少 ${REQUIRED_COMPILE_DISK_GIB} GiB (实测 $((available_kib / 1024 / 1024)) GiB)。"
+            exit 1
+          fi
+          du -sh "$TWRP_TOP"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Building TWRP
+        # 关键: 步骤级超时要远小于 job 的 6h 上限。若任由 GitHub 在 360 分钟
+        # 平台强杀整个 job, 后面的 ccache 保存步骤不会执行, 缓存永远建立不起来,
+        # 每次运行都从零冷编译 => 每次都在第 6 小时被杀 (exit 143) 死循环。
+        # 步骤超时是"优雅失败", always() 的保存步骤仍会执行。
+        timeout-minutes: 250
+        shell: bash
+        working-directory: ${{ env.TWRP_TOP }}
+        env:
+          ALLOW_MISSING_DEPENDENCIES: 'true'
+          GOMEMLIMIT: '3GiB'
+          GOGC: '20'
+          _JAVA_OPTIONS: '-Xmx3g'
+          USE_CCACHE: '1'
+          CCACHE_EXEC: /usr/bin/ccache
+          CCACHE_COMPILERCHECK: content
+          CCACHE_COMPRESS: 'true'
+        run: |
+          set -euo pipefail
+          build_jobs="$(nproc)"
+          export NINJA_ARGS="-j${build_jobs} -l${build_jobs}"
+          printf 'Using %s Ninja jobs\n' "$build_jobs"
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ build heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          set +u
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.MAKEFILE_NAME }}
+
+          # 逐个目标分别构建, 不用一条 `make A B -j`。
+          # 合并构建时并行输出会互相淹没, 定位不到是哪个目标失败; 分开后
+          # 每个目标有独立日志, 便于定位失败目标。
+          build_target_log="$GITHUB_WORKSPACE/twrp-build.log"
+          : > "$build_target_log"
+
+          for target in ${{ github.event.inputs.BUILD_TARGET }}; do
+            echo "===== BUILD TARGET: $target =====" | tee -a "$build_target_log"
+            if make "$target" -j"$build_jobs" 2>&1 | tee -a "$build_target_log"; then
+              echo "===== TARGET OK: $target =====" | tee -a "$build_target_log"
+            else
+              echo "===== TARGET FAILED: $target =====" | tee -a "$build_target_log"
+              echo "::error::构建目标 $target 失败, 详见上方日志中的 TARGET FAILED 段落"
+              kill "$heartbeat_pid" 2>/dev/null || true
+              trap - EXIT
+              exit 1
+            fi
+          done
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Verify recovery payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 本步骤只对会产出 recovery ramdisk 的目标有意义。
+          if [[ "${{ github.event.inputs.BUILD_TARGET }}" != *recoveryimage* ]] &&
+             [[ "${{ github.event.inputs.BUILD_TARGET }}" != *vendorbootimage* ]]; then
+            echo "BUILD_TARGET 不含 recoveryimage / vendorbootimage, 跳过 ramdisk 载荷自检"
+            exit 0
+          fi
+
+          device_dir="$TWRP_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          product="$TWRP_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          root="$product/recovery/root"
+
+          if [[ ! -d "$root" ]]; then
+            echo "::error::未生成 recovery root: $root"
+            exit 1
+          fi
+
+          echo "::group::ramdisk 载荷自检"
+
+          # prebuilt/recovery_modules 仅部分设备树提供; 没有则跳过模块比对,
+          # 只做基础存在性校验。
+          essential_list="$device_dir/prebuilt/recovery_modules/essential_modules.txt"
+          shopt -s nullglob
+          if [[ -f "$essential_list" ]]; then
+            prebuilt_modules=()
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -n "$mod" ]] || continue
+              prebuilt_modules+=("$device_dir/prebuilt/recovery_modules/$mod")
+            done < "$essential_list"
+          else
+            prebuilt_modules=("$device_dir"/prebuilt/recovery_modules/*.ko)
+          fi
+          shopt -u nullglob
+
+          if [[ "${#prebuilt_modules[@]}" -gt 0 ]]; then
+            missing=()
+            for module in "${prebuilt_modules[@]}"; do
+              if [[ ! -f "$root/lib/modules/$(basename "$module")" ]]; then
+                missing+=("$(basename "$module")")
+              fi
+            done
+            if [[ "${#missing[@]}" -gt 0 ]]; then
+              echo "::error::ramdisk 缺少 ${#missing[@]}/${#prebuilt_modules[@]} 个 essential 模块, 例: ${missing[*]:0:5}"
+              exit 1
+            fi
+            echo "内核模块: ${#prebuilt_modules[@]} 个 essential 模块全部就位"
+          else
+            echo "设备树未提供 prebuilt/recovery_modules, 跳过逐模块比对"
+          fi
+
+          if [[ -f "$root/ramdisk-files.txt" ]]; then
+            echo "ramdisk 清单: $(wc -l < "$root/ramdisk-files.txt") 条"
+          fi
+
+          # mkbootfs 打不开目录时只打印一行就继续, ninja 视而不见。
+          if [[ -f "$GITHUB_WORKSPACE/twrp-build.log" ]] && \
+             grep -q 'mkbootfs: cannot open directory' "$GITHUB_WORKSPACE/twrp-build.log"; then
+            echo "::warning::mkbootfs 打不开 vendor_ramdisk 目录, 相关镜像可能为空包"
+          fi
+          echo "::endgroup::"
+
+          # 运行时确认构建产物 header 的绝对地址, 与静态校验互为印证。
+          for img in vendor_boot.img recovery.img boot.img; do
+            if [[ -f "$product/$img" ]]; then
+              unpack="$TWRP_TOP/system/tools/mkbootimg/unpack_bootimg.py"
+              if [[ -f "$unpack" ]]; then
+                echo "::group::构建产物 $img header"
+                python3 "$unpack" \
+                  --boot_img "$product/$img" \
+                  --out "$GITHUB_WORKSPACE/header-check" || true
+                echo "::endgroup::"
+              fi
+              break
+            fi
+          done
 
       - name: Report compiler cache
-     if: always()
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
           ccache -s
           du -sh "$CCACHE_DIR"
+
       - name: Collect release artifact
         shell: bash
         run: |
@@ -701,3 +1044,5 @@ jobs:
           body_path: release-artifacts/build-info.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+     
