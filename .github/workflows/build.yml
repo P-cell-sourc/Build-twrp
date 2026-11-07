@@ -69,7 +69,7 @@ concurrency:
 env:
   TWRP_TOP: ${{ github.workspace }}/TWRP
   CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: '3G'
+  CCACHE_MAXSIZE: '5G'
   CCACHE_CACHE_VERSION: '1'
   MIN_SWAP_GIB: '12'
   # twrp-16.0 源码 + out 峰值约需 65 GiB, 另留 3 GiB 编译缓存。
@@ -225,6 +225,7 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Sync TWRP sources
+        timeout-minutes: 75
         shell: bash
         run: |
           set -euo pipefail
@@ -275,7 +276,7 @@ jobs:
 
           sync_succeeded=0
           for sync_attempt in 1 2 3 4; do
-            if repo sync -c -j4 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch \
+            if repo sync -c -j16 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch \
                  2>&1 | tee /tmp/repo-sync.log; then
               sync_succeeded=1
               break
@@ -373,7 +374,7 @@ jobs:
               break
             fi
           done
-          repo sync -j"$(nproc)"
+          repo sync -j16
 
       - name: Drop sync metadata
         shell: bash
@@ -398,6 +399,11 @@ jobs:
           df -h "$GITHUB_WORKSPACE"
 
       - name: Building TWRP
+        # 关键: 步骤级超时要远小于 job 的 6h 上限。若任由 GitHub 在 360 分钟
+        # 平台强杀整个 job, 后面的 ccache 保存步骤不会执行, 缓存永远建立不起来,
+        # 每次运行都从零冷编译 => 每次都在第 6 小时被杀 (exit 143) 死循环。
+        # 步骤超时是"优雅失败", always() 的保存步骤仍会执行。
+        timeout-minutes: 250
         shell: bash
         working-directory: ${{ env.TWRP_TOP }}
         env:
@@ -531,15 +537,4 @@ jobs:
           done
 
       - name: Report compiler cache
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          ccache -s
-          du -sh "$CCACHE_DIR"
-
-      - name: Collect release artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          product="$T
+   
