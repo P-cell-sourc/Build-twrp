@@ -52,7 +52,7 @@ on:
       BUILD_TARGET:
         description: 'BUILD_TARGET (make 目标, 空格分隔: recoveryimage / vendorbootimage / bootimage)'
         required: true
-        default: 'vendorbootimage'
+        default: 'recoveryimage'
       PUBLISH:
         description: '构建成功后创建 GitHub Release'
         required: false
@@ -537,4 +537,167 @@ jobs:
           done
 
       - name: Report compiler cache
-   
+     if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache -s
+          du -sh "$CCACHE_DIR"
+      - name: Collect release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          product="$TWRP_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          test -d "$product"
+          rm -rf "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          shopt -s nullglob
+          images=("$product"/*.img "$product"/*.zip)
+          shopt -u nullglob
+          for image in "${images[@]}"; do
+            # 剔除内部没有任何镜像的空壳 zip, 避免误刷。
+            case "$image" in
+              *.zip)
+                if ! unzip -Z1 "$image" 2>/dev/null | grep -qE '\.img$'; then
+                  echo "::warning::跳过无镜像空壳包: $(basename "$image")"
+                  continue
+                fi
+                ;;
+            esac
+            cp -fp "$image" "$GITHUB_WORKSPACE/artifacts/"
+          done
+
+          if [[ -z "$(ls -A "$GITHUB_WORKSPACE/artifacts")" ]]; then
+            echo "::error::没有收集到任何产物"
+            ls -all "$product"
+            exit 1
+          fi
+          (
+            cd "$GITHUB_WORKSPACE/artifacts"
+            sha256sum * > sha256sums.txt
+          )
+          cat > "$GITHUB_WORKSPACE/artifacts/build-info.md" <<EOF
+          Automated TWRP build for ${{ github.event.inputs.DEVICE_NAME }}.
+
+          - TWRP branch: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Manifest: ${{ github.event.inputs.MANIFEST_URL }}
+          - Device tree: ${{ github.event.inputs.DEVICE_TREE_URL }} (${{ github.event.inputs.DEVICE_TREE_BRANCH }})
+          - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          刷入 (A/B 设备):
+              fastboot flash recovery_a <镜像> && fastboot flash recovery_b <镜像>
+          EOF
+          ls -all "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Save compiler cache
+        if: ${{ always() && steps.ccache_restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: twrp-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ github.event.inputs.DEVICE_NAME }}-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: twrp-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 自动提取失败真因, 省去在海量并行日志里人工翻找。
+      - name: Diagnose build failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$GITHUB_WORKSPACE/twrp-build.log"
+          product="$TWRP_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+
+          echo "::group::[1/5] 各构建目标结果"
+          if [[ -f "$log" ]]; then
+            grep -n '^===== \(BUILD \)\?TARGET' "$log" || echo "(无 TARGET 段落)"
+          else
+            echo "(无构建日志)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[2/5] ninja FAILED 目标及失败命令"
+          if [[ -f "$log" ]]; then
+            grep -n -A 12 '^FAILED' "$log" | head -150 || echo "(未找到 FAILED 行)"
+          else
+            echo "(无构建日志)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[3/5] 常见错误关键字扫描"
+          if [[ -f "$log" ]]; then
+            grep -n -i -E 'error:|error [0-9]+|No such file or directory|No rule to make|exceed|too large|out of|undefined|not defined' \
+              "$log" | head -80 || echo "(未匹配到常见错误关键字)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[4/5] out 目录产物"
+          if [[ -d "$product" ]]; then
+            ls -la "$product" 2>/dev/null \
+              | grep -E 'vendor_boot|ramdisk|recovery|dtb|kernel' || echo "(无相关产物)"
+          else
+            echo "(out 目录不存在)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[5/5] 设备树 boot/vendor_boot 配置"
+          bc="$TWRP_TOP/${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk"
+          if [[ -f "$bc" ]]; then
+            grep -n -E 'PARTITION_SIZE|MKBOOTIMG|RAMDISK|RECOVERY|BOOT_HEADER|PREBUILT' \
+              "$bc" || echo "(无匹配配置)"
+          fi
+          echo "::endgroup::"
+
+      - name: Clean build worktree
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$TWRP_TOP" \
+            "$GITHUB_WORKSPACE/artifacts" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+
+  release:
+    if: ${{ needs.build.result == 'success' && github.event.inputs.PUBLISH == 'true' }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: twrp-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*
+          name: TWRP-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.run_id }}
+          tag_name: twrp-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.run_id }}
+          prerelease: true
+          body_path: release-artifacts/build-info.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
